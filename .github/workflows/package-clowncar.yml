@@ -1,0 +1,190 @@
+name: Package ClownCar Script
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: PowerShell script to package
+        required: false
+        default: |
+          # Paste this into PowerShell for an instant "pimped" terminal (temporary)
+          $host.UI.RawUI.BackgroundColor = 'DarkMagenta'
+          $host.UI.RawUI.ForegroundColor = 'Cyan'
+          Clear-Host
+          function prompt { "😎 PS " + (Get-Location) + "> " }
+          Write-Host "✨ PowerShell just got some style. Temporary until you close this window!" -ForegroundColor Yellow
+
+permissions:
+  contents: write
+
+env:
+  ARTIFACT_NAME: clown-car-package
+
+jobs:
+  package:
+    name: Build ClownCar Package
+    runs-on: windows-latest
+    env:
+      PACKAGE_FILENAME: ${{ format('clown-car-package-{0}.bat', github.run_id) }}
+      SCRIPT_SNIPPET: ${{ github.event.inputs.script }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prepare packaging workspace
+        id: prepare
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $assetsRoot = Join-Path $PWD 'packaging_assets'
+          New-Item -Path $assetsRoot -ItemType Directory -Force | Out-Null
+
+          $scriptContent = $env:SCRIPT_SNIPPET
+          if ([string]::IsNullOrWhiteSpace($scriptContent)) {
+            $scriptContent = @'
+          # Paste this into PowerShell for an instant "pimped" terminal (temporary)
+          $host.UI.RawUI.BackgroundColor = 'DarkMagenta'
+          $host.UI.RawUI.ForegroundColor = 'Cyan'
+          Clear-Host
+          function prompt { "😎 PS " + (Get-Location) + "> " }
+          Write-Host "✨ PowerShell just got some style. Temporary until you close this window!" -ForegroundColor Yellow
+          '@
+          }
+
+          $snippetPath = Join-Path $assetsRoot 'snippet.ps1'
+          Set-Content -LiteralPath $snippetPath -Value $scriptContent -Encoding utf8
+
+          $mainContent = @'
+function Main {
+    param()
+
+    . "$PSScriptRoot\snippet.ps1"
+}
+'@
+
+          $mainPath = Join-Path $assetsRoot 'main.psm1'
+          Set-Content -LiteralPath $mainPath -Value $mainContent -Encoding utf8
+
+          "ASSETS_DIR=$assetsRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build self-extracting package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $modulePath = Join-Path $PWD 'resources\clown-car-packager-api.psm1'
+          Import-Module $modulePath -Force
+
+          $packagePath = Join-Path $PWD $env:PACKAGE_FILENAME
+          Write-ClownCar -outFile $packagePath -sourceDirectory $env:ASSETS_DIR
+
+          Write-Host "Package created at $packagePath"
+          "PACKAGE_PATH=$packagePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.PACKAGE_PATH }}
+          if-no-files-found: error
+
+  verify:
+    name: Verify Packaged Script
+    needs: package
+    runs-on: windows-latest
+    steps:
+      - name: Download packaged artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: packaged
+
+      - name: Execute packaged script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $artifact = Get-ChildItem -Path (Join-Path $PWD 'packaged') -Filter '*.bat' -File -Recurse | Select-Object -First 1
+          if (-not $artifact) {
+            throw "Unable to locate packaged script artifact."
+          }
+
+          Write-Host "Running packaged script: $($artifact.FullName)"
+
+          $process = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', "`"$($artifact.FullName)`"" -NoNewWindow -PassThru
+
+          if (-not $process.WaitForExit(120000)) {
+            try { $process.Kill() } catch {}
+            throw "Packaged script did not finish within the allotted time."
+          }
+
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged script exited with code $($process.ExitCode)."
+          }
+
+  release:
+    name: Tag and Release
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      TAG_PREFIX: clowncar-
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download packaged artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist
+
+      - name: Prepare release notes
+        id: notes
+        run: |
+          cat <<'EOF' > release-notes.md
+## Summary
+- Script packaged via ClownCar workflow run ${{ github.run_id }}
+- Triggered by ${{ github.actor }}
+EOF
+          echo "notes-path=release-notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG_NAME="${TAG_PREFIX}${GITHUB_RUN_NUMBER}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --tags
+
+          if git show-ref --tags --quiet --verify "refs/tags/${TAG_NAME}"; then
+            echo "Tag ${TAG_NAME} already exists." >&2
+            exit 1
+          fi
+
+          git tag -a "${TAG_NAME}" -m "ClownCar package from workflow run ${GITHUB_RUN_ID}"
+          git push origin "${TAG_NAME}"
+
+          echo "tag-name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+        shell: bash
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${{ steps.tag.outputs['tag-name'] }}"
+          NOTES_PATH="${{ steps.notes.outputs['notes-path'] }}"
+
+          gh release create "${TAG_NAME}" dist/*.bat \
+            --target "${GITHUB_SHA}" \
+            --title "ClownCar package ${TAG_NAME}" \
+            --notes-file "${NOTES_PATH}"
+        shell: bash
